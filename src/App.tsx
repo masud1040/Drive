@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { collection, query, orderBy, onSnapshot, addDoc, serverTimestamp, where, getDocs, doc, updateDoc, deleteDoc } from 'firebase/firestore';
 import { signInWithPopup, GoogleAuthProvider, onAuthStateChanged, signOut, User } from 'firebase/auth';
@@ -6,10 +6,11 @@ import { PieChart, Pie, Cell } from 'recharts';
 import { 
   Folder, Plus, Upload, Image as ImageIcon, Menu, X, AlertCircle, LogOut, Lock,
   Search, MoreVertical, Home, Star, Users, Clock, CheckCircle, Trash2, AlertOctagon, Settings, HelpCircle, Cloud, Camera, Grid, List, RotateCcw, ArrowLeft,
-  FileText, Table, MonitorPlay, Link, Edit2, Palette, CornerUpRight, FolderOutput, Info, Copy, Share2, Download, HardDrive, SlidersHorizontal
+  FileText, Table, MonitorPlay, Link, Edit2, Palette, CornerUpRight, FolderOutput, Info, Copy, Share2, Download, HardDrive, SlidersHorizontal, Send,
+  File, FileCode, Music, FileArchive, FileType2
 } from 'lucide-react';
 import { db, auth } from './lib/firebase';
-import { uploadImageToTelegram, getImageUrlFromTelegram } from './lib/telegram';
+import { uploadFileToTelegram, getImageUrlFromTelegram } from './lib/telegram';
 import type { Folder as FolderType, DriveImage, UserSettings } from './types';
 import { cn } from './lib/utils';
 
@@ -78,9 +79,11 @@ export default function App() {
   const [selectedFolderId, setSelectedFolderId] = useState<string | null>(() => localStorage.getItem('selectedFolderId') || null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(-1); // -1 means no progress or indeterminate
   const [newFolderName, setNewFolderName] = useState('');
   const [isCreatingFolder, setIsCreatingFolder] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
   
   // Navigation State
   const [activeTab, setActiveTab] = useState(() => localStorage.getItem('activeTab') || 'files');
@@ -105,19 +108,25 @@ export default function App() {
 
   // Image URL caching
   const [imageUrls, setImageUrls] = useState<Record<string, string>>({});
+  const [urlErrors, setUrlErrors] = useState<Record<string, string>>({});
+
+  // Telegram Config Form State
+  const [telegramTokenInput, setTelegramTokenInput] = useState('');
+  const [telegramChatIdInput, setTelegramChatIdInput] = useState('');
 
   // Folder actions state
   const [activeFolderMenu, setActiveFolderMenu] = useState<FolderType | null>(null);
-  const [isRenamingFolder, setIsRenamingFolder] = useState(false);
+  const [renamingFolderId, setRenamingFolderId] = useState<string | null>(null);
   const [renameFolderName, setRenameFolderName] = useState('');
   const [selectedFolderColor, setSelectedFolderColor] = useState('#8c4a43');
 
   // Image actions state
   const [activeImageMenu, setActiveImageMenu] = useState<DriveImage | null>(null);
-  const [isRenamingImage, setIsRenamingImage] = useState(false);
+  const [renamingImageId, setRenamingImageId] = useState<string | null>(null);
   const [isStorageModalOpen, setIsStorageModalOpen] = useState(false);
   const [renameImageName, setRenameImageName] = useState('');
   const [imageInfoModal, setImageInfoModal] = useState<DriveImage | null>(null);
+  const [folderInfoModal, setFolderInfoModal] = useState<FolderType | null>(null);
   const [deleteChannelConfirm, setDeleteChannelConfirm] = useState<DriveImage | null>(null);
   const [movingItem, setMovingItem] = useState<{ id: string; type: 'folder' | 'image'; currentParentId: string | null } | null>(null);
   const [draggedItem, setDraggedItem] = useState<{ id: string; type: 'folder' | 'image' } | null>(null);
@@ -324,16 +333,43 @@ export default function App() {
       
       setImages(allImages);
 
-      // Fetch URLs asynchronously and update local cache
-      allImages.forEach(img => {
-        if (!imageUrls[img.fileId]) {
-          getImageUrlFromTelegram(img.fileId).then(url => {
-            setImageUrls(prev => ({ ...prev, [img.fileId]: url }));
-          }).catch(err => {
-            console.error(`Failed to load URL for image ${img.fileId}:`, err);
-          });
+      // Fetch URLs asynchronously with concurrency limit to avoid "Failed to fetch" browser errors
+      const currentToken = settings.telegramBotToken?.trim();
+      if (!currentToken) return;
+
+      const fetchUrls = async () => {
+        const queue = allImages.filter(img => !imageUrls[img.fileId]);
+        const BATCH_SIZE = 3; // Process 3 images at a time
+        
+        for (let i = 0; i < queue.length; i += BATCH_SIZE) {
+          const batch = queue.slice(i, i + BATCH_SIZE);
+          await Promise.all(batch.map(async (img) => {
+            // Proactively check size to avoid "Bad Request: file is too big" from Telegram API (20MB limit for bots)
+            if (img.size && img.size > 20 * 1024 * 1024) {
+              setUrlErrors(prev => ({ ...prev, [img.fileId]: "Bad Request: file is too big" }));
+              return;
+            }
+
+            try {
+              const url = await getImageUrlFromTelegram(img.fileId, currentToken);
+              setImageUrls(prev => ({ ...prev, [img.fileId]: url }));
+              setUrlErrors(prev => {
+                const newErrors = { ...prev };
+                delete newErrors[img.fileId];
+                return newErrors;
+              });
+            } catch (err: any) {
+              // Only log unexpected errors to reduce noise
+              if (!err.message?.includes('too big')) {
+                console.error(`Failed to load URL for image ${img.fileId}:`, err);
+              }
+              setUrlErrors(prev => ({ ...prev, [img.fileId]: err.message }));
+            }
+          }));
         }
-      });
+      };
+      
+      fetchUrls();
     }, (err) => {
       setError("Failed to load images.");
       handleFirestoreError(err, OperationType.LIST, 'images');
@@ -341,6 +377,14 @@ export default function App() {
 
     return () => unsubscribe();
   }, [user, isAuthReady]);
+
+  // Handle search focus
+  useEffect(() => {
+    if (toast) {
+      const timer = setTimeout(() => setToast(null), 4000);
+      return () => clearTimeout(timer);
+    }
+  }, [toast]);
 
   const handleCreateFolder = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -351,41 +395,46 @@ export default function App() {
       return;
     }
 
+    const folderName = newFolderName.trim();
+    const folderColor = selectedFolderColor;
+    const parentId = selectedFolderId || 'root';
+
+    // Optimistic UI: Close modal and show toast immediately
+    setIsCreatingFolder(false);
+    setNewFolderName('');
+    setSelectedFolderColor('#8c4a43');
+    setToast({ message: "Folder created successfully!", type: 'success' });
+
     try {
-      setIsCreatingFolder(true);
       await addDoc(collection(db, 'folders'), {
-        name: newFolderName.trim(),
+        name: folderName,
         userId: user.uid,
         createdAt: serverTimestamp(),
         isDeleted: false,
-        parentId: selectedFolderId || 'root',
+        parentId: parentId,
         isStarred: false,
-        color: selectedFolderColor
+        color: folderColor
       });
-      setNewFolderName('');
-      setSelectedFolderColor('#8c4a43');
-      setIsCreatingFolder(false);
     } catch (err) {
-      setError("Failed to create folder.");
+      setToast({ message: "Failed to create folder.", type: 'error' });
       handleFirestoreError(err, OperationType.CREATE, 'folders');
-      setIsCreatingFolder(false);
     }
   };
 
   const handleRenameFolder = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!db || !renameFolderName.trim() || !user || !activeFolderMenu) return;
+    if (!db || !renameFolderName.trim() || !user || !renamingFolderId) return;
 
     try {
-      await updateDoc(doc(db, 'folders', activeFolderMenu.id), {
+      await updateDoc(doc(db, 'folders', renamingFolderId), {
         name: renameFolderName.trim()
       });
       setRenameFolderName('');
-      setIsRenamingFolder(false);
-      setActiveFolderMenu(null);
+      setRenamingFolderId(null);
+      setToast({ message: "Folder renamed successfully!", type: 'success' });
     } catch (err) {
       setError("Failed to rename folder.");
-      handleFirestoreError(err, OperationType.UPDATE, `folders/${activeFolderMenu.id}`);
+      handleFirestoreError(err, OperationType.UPDATE, `folders/${renamingFolderId}`);
     }
   };
 
@@ -405,40 +454,38 @@ export default function App() {
   const handleToggleFolderLock = async (folder: FolderType) => {
     if (!db || !user) return;
     
-    // If setting a lock, check if passcode exists
-    if (!folder.isLocked && !settings.passcode) {
+    // Check if passcode exists in settings
+    if (!settings.passcode) {
       setError("Please set a passcode in settings first.");
       setShowPasscodeSetup(true);
       setActiveFolderMenu(null);
       return;
     }
 
-    // If currently locked, require passcode to UNLOCK it via menu
-    if (folder.isLocked) {
-      setPasscodeModal({
-        id: folder.id,
-        type: 'unlock_toggle',
-        folder: folder,
-        onSuccess: async () => {
+    // Always require passcode to toggle lock status (both lock and unlock)
+    setPasscodeModal({
+      id: folder.id,
+      type: 'unlock_toggle',
+      folder: folder,
+      onSuccess: async () => {
+        try {
           await updateDoc(doc(db, 'folders', folder.id), {
-            isLocked: false
+            isLocked: !folder.isLocked
           });
           setActiveFolderMenu(null);
+          setToast({ 
+            message: !folder.isLocked ? "Folder locked" : "Folder unlocked", 
+            type: 'success' 
+          });
+        } catch (err) {
+          setError("Failed to toggle folder lock.");
+          handleFirestoreError(err, OperationType.UPDATE, `folders/${folder.id}`);
         }
-      });
-      setActiveFolderMenu(null);
-      return;
-    }
-    
-    try {
-      await updateDoc(doc(db, 'folders', folder.id), {
-        isLocked: true
-      });
-      setActiveFolderMenu(null);
-    } catch (err) {
-      setError("Failed to toggle folder lock.");
-      handleFirestoreError(err, OperationType.UPDATE, `folders/${folder.id}`);
-    }
+      }
+    });
+    setPasscodeInput('');
+    setPasscodeError(false);
+    setActiveFolderMenu(null);
   };
 
   const handleOpenFolder = (folder: FolderType) => {
@@ -507,18 +554,18 @@ export default function App() {
 
   const handleRenameImage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!db || !renameImageName.trim() || !user || !activeImageMenu) return;
+    if (!db || !renameImageName.trim() || !user || !renamingImageId) return;
 
     try {
-      await updateDoc(doc(db, 'images', activeImageMenu.id), {
+      await updateDoc(doc(db, 'images', renamingImageId), {
         name: renameImageName.trim()
       });
       setRenameImageName('');
-      setIsRenamingImage(false);
-      setActiveImageMenu(null);
+      setRenamingImageId(null);
+      setToast({ message: "File renamed successfully!", type: 'success' });
     } catch (err) {
       setError("Failed to rename image.");
-      handleFirestoreError(err, OperationType.UPDATE, `images/${activeImageMenu.id}`);
+      handleFirestoreError(err, OperationType.UPDATE, `images/${renamingImageId}`);
     }
   };
 
@@ -529,6 +576,7 @@ export default function App() {
         isStarred: !image.isStarred
       });
       setActiveImageMenu(null);
+      setToast({ message: image.isStarred ? "Removed from Starred" : "Added to Starred", type: 'success' });
     } catch (err) {
       setError("Failed to update image.");
       handleFirestoreError(err, OperationType.UPDATE, `images/${image.id}`);
@@ -536,6 +584,11 @@ export default function App() {
   };
 
   const handleDownloadImage = async (image: DriveImage) => {
+    if (urlErrors[image.fileId]) {
+      alert(`Cannot download: ${urlErrors[image.fileId]}\n\n(Telegram limits bot downloads to 20MB. Please download large files directly from your Telegram channel)`);
+      setActiveImageMenu(null);
+      return;
+    }
     const url = imageUrls[image.fileId] || image.url;
     if (!url) {
       alert("Image is still loading...");
@@ -609,6 +662,7 @@ export default function App() {
           folderId: targetFolderId
         });
       }
+      setToast({ message: "Moved successfully!", type: 'success' });
     } catch (err) {
       setError(`Failed to move ${type}.`);
       handleFirestoreError(err, OperationType.UPDATE, `${type}s/${itemId}`);
@@ -652,15 +706,49 @@ export default function App() {
       await deleteDoc(doc(db, 'images', imageId));
       
       // 2. Delete message from Telegram if we have messageId
-      if (messageId) {
+      if (messageId && settings.telegramBotToken && settings.telegramChatId) {
         // We'll import deleteImageFromTelegram at the top
         const { deleteImageFromTelegram } = await import('./lib/telegram');
-        await deleteImageFromTelegram(messageId);
+        await deleteImageFromTelegram(messageId, settings.telegramBotToken, settings.telegramChatId);
       }
     } catch (err) {
       setError("Failed to delete from channel.");
       handleFirestoreError(err, OperationType.DELETE, `images/${imageId}`);
     }
+  };
+
+  const formatFileSize = (bytes?: number) => {
+    if (!bytes) return '-';
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  };
+
+  const getFileTypeName = (fileName: string) => {
+    const ext = fileName.split('.').pop()?.toLowerCase();
+    if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext || '')) return 'Image';
+    if (['mp4', 'mov', 'avi', 'mkv', 'webm'].includes(ext || '')) return 'Video';
+    if (['mp3', 'wav', 'ogg', 'm4a'].includes(ext || '')) return 'Audio';
+    if (['pdf'].includes(ext || '')) return 'PDF Document';
+    if (['doc', 'docx'].includes(ext || '')) return 'Word Document';
+    if (['xls', 'xlsx', 'csv'].includes(ext || '')) return 'Spreadsheet';
+    if (['ppt', 'pptx'].includes(ext || '')) return 'Presentation';
+    if (ext === 'json') return 'JSON File';
+    if (['zip', 'rar', '7z'].includes(ext || '')) return 'Archive';
+    return ext ? ext.toUpperCase() + ' File' : 'File';
+  };
+
+  const getFileIcon = (fileName: string) => {
+    const ext = fileName.split('.').pop()?.toLowerCase();
+    if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'].includes(ext || '')) return <ImageIcon className="w-5 h-5 text-primary" />;
+    if (['mp4', 'mov', 'avi', 'mkv', 'webm'].includes(ext || '')) return <MonitorPlay className="w-5 h-5 text-blue-400" />;
+    if (['mp3', 'wav', 'ogg', 'm4a'].includes(ext || '')) return <Music className="w-5 h-5 text-purple-400" />;
+    if (['pdf'].includes(ext || '')) return <FileType2 className="w-5 h-5 text-red-500" />;
+    if (['doc', 'docx', 'txt', 'rtf'].includes(ext || '')) return <FileText className="w-5 h-5 text-blue-500" />;
+    if (['xls', 'xlsx', 'csv'].includes(ext || '')) return <Table className="w-5 h-5 text-green-500" />;
+    if (['json', 'js', 'ts', 'html', 'css', 'py', 'cpp'].includes(ext || '')) return <FileCode className="w-5 h-5 text-yellow-500" />;
+    if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext || '')) return <FileArchive className="w-5 h-5 text-orange-500" />;
+    return <File className="w-5 h-5 text-text-muted" />;
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>, specificFolderId?: string) => {
@@ -676,19 +764,32 @@ export default function App() {
       }
     }
 
+    // Check Telegram tokens configuration
+    if (!settings.telegramBotToken || !settings.telegramChatId) {
+      alert("Please add token and channel ID in Settings.");
+      setIsSettingsOpen(true);
+      return;
+    }
+
     try {
       setIsUploading(true);
+      setUploadProgress(0);
       setError(null);
       
       // 1. Upload to Telegram
-      const { fileId, messageId } = await uploadImageToTelegram(file);
+      const { fileId, messageId } = await uploadFileToTelegram(
+        file, 
+        settings.telegramBotToken, 
+        settings.telegramChatId,
+        (progress) => setUploadProgress(progress)
+      );
       
       // 2. Save metadata to Firestore
-      let targetFolderId = specificFolderId || selectedFolderId || 'root';
+      let targetFolderId = specificFolderId || selectedFolderId;
       
-      // If triggered from sidebar, specificFolderId will be 'undefined_lookup'
-      if (specificFolderId === 'undefined_lookup') {
-        const undefinedFolder = folders.find(f => f.name.toLowerCase() === 'undefined' && !f.isDeleted);
+      // If root or undefined lookup is used, route to "undefined" folder
+      if (!targetFolderId || targetFolderId === 'root' || specificFolderId === 'undefined_lookup') {
+        const undefinedFolder = folders.find(f => f.name.toLowerCase() === 'undefined' && (!f.parentId || f.parentId === 'root') && !f.isDeleted);
         if (undefinedFolder) {
           targetFolderId = undefinedFolder.id;
         } else {
@@ -698,7 +799,10 @@ export default function App() {
               userId: user.uid,
               createdAt: serverTimestamp(),
               isStarred: false,
-              isDeleted: false
+              isDeleted: false,
+              parentId: 'root',
+              color: '#8c4a43',
+              isLocked: false
             });
             targetFolderId = docRef.id;
           } catch (err) {
@@ -718,14 +822,18 @@ export default function App() {
         isDeleted: false,
         isStarred: false
       });
-      
+      setToast({ message: "File uploaded successfully!", type: 'success' });
     } catch (err: any) {
       setError(err.message || "Failed to upload image.");
-      if (err.message && !err.message.includes("Telegram")) {
+      if (err.message && err.message.toLowerCase().includes("bad request")) {
+        // This is a Telegram API error, we just show it to the user.
+        alert(`Telegram Error: ${err.message}\n\nPlease check your Channel ID and make sure the bot is added as an admin in the channel/group.`);
+      } else {
         handleFirestoreError(err, OperationType.CREATE, 'images');
       }
     } finally {
       setIsUploading(false);
+      setUploadProgress(-1);
       // Reset input
       e.target.value = '';
     }
@@ -746,9 +854,9 @@ export default function App() {
       const { deleteImageFromTelegram } = await import('./lib/telegram');
       const imageDeletions = trashImages.map(async (image) => {
         const activeCopy = activeImages.find(img => img.fileId === image.fileId);
-        if (!activeCopy && image.messageId) {
+        if (!activeCopy && image.messageId && settings.telegramBotToken && settings.telegramChatId) {
           try {
-            await deleteImageFromTelegram(image.messageId);
+            await deleteImageFromTelegram(image.messageId, settings.telegramBotToken, settings.telegramChatId);
           } catch (e) {
             console.error("Failed to delete from telegram:", e);
           }
@@ -781,6 +889,7 @@ export default function App() {
     e.stopPropagation();
     try {
       await updateDoc(doc(db, collectionName, id), { isDeleted: false });
+      setToast({ message: "Item restored successfully!", type: 'success' });
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, collectionName);
     }
@@ -790,28 +899,45 @@ export default function App() {
     e.stopPropagation();
     try {
       await deleteDoc(doc(db, collectionName, id));
+      setToast({ message: "Item deleted permanently!", type: 'success' });
     } catch (err) {
       handleFirestoreError(err, OperationType.DELETE, collectionName);
     }
   };
 
   // Derived State for Views
-  const activeFolders = folders.filter(f => !f.isDeleted);
-  const trashFolders = folders.filter(f => f.isDeleted);
-  const activeImages = images.filter(i => !i.isDeleted);
-  const trashImages = images.filter(i => i.isDeleted);
-  const rootImages = activeImages.filter(i => i.folderId === 'root');
-  const currentFolderImages = activeImages.filter(i => i.folderId === selectedFolderId);
-  const recentImages = [...activeImages].sort((a, b) => b.createdAt - a.createdAt).slice(0, 20);
-  const starredFolders = activeFolders.filter(f => f.isStarred);
-  const starredImages = activeImages.filter(i => i.isStarred);
-  const offlineImages = activeImages.filter(i => i.isOffline);
+  const activeFolders = useMemo(() => folders.filter(f => !f.isDeleted), [folders]);
+  const trashFolders = useMemo(() => folders.filter(f => f.isDeleted), [folders]);
+  const activeImages = useMemo(() => images.filter(i => !i.isDeleted), [images]);
+  const trashImages = useMemo(() => images.filter(i => i.isDeleted), [images]);
+  const rootImages = useMemo(() => activeImages.filter(i => i.folderId === 'root'), [activeImages]);
+  const currentFolderImages = useMemo(() => activeImages.filter(i => i.folderId === selectedFolderId), [activeImages, selectedFolderId]);
+  const recentImages = useMemo(() => [...activeImages].sort((a, b) => b.createdAt - a.createdAt).slice(0, 20), [activeImages]);
+  const starredFolders = useMemo(() => activeFolders.filter(f => f.isStarred), [activeFolders]);
+  const starredImages = useMemo(() => activeImages.filter(i => i.isStarred), [activeImages]);
+  const offlineImages = useMemo(() => activeImages.filter(i => i.isOffline), [activeImages]);
   
-  const selectedFolder = folders.find(f => f.id === selectedFolderId);
+  const selectedFolder = useMemo(() => folders.find(f => f.id === selectedFolderId), [folders, selectedFolderId]);
 
   let displayFolders: FolderType[] = [];
   let displayImages: DriveImage[] = [];
   let viewTitle = "My Drive";
+
+  // Storage computation
+  const totalSizeBytes = useMemo(() => images.reduce((acc, i) => acc + (i.size || 0), 0), [images]);
+  const totalSizeGB = totalSizeBytes / (1024 * 1024 * 1024);
+  const displayStorageText = totalSizeGB < 1 ? (totalSizeBytes / (1024 * 1024)).toFixed(1) + ' MB' : totalSizeGB.toFixed(2) + ' GB';
+  
+  let storagePercentage = 0;
+  if (totalSizeGB <= 10) {
+    storagePercentage = (totalSizeGB / 10) * 50;
+  } else if (totalSizeGB <= 20) {
+    storagePercentage = 50 + ((totalSizeGB - 10) / 10) * 20;
+  } else if (totalSizeGB <= 50) {
+    storagePercentage = 70 + ((totalSizeGB - 20) / 30) * 20;
+  } else {
+    storagePercentage = Math.min(99, 90 + ((totalSizeGB - 50) / 50) * 9);
+  }
 
   if (activeTab === 'starred' || sidebarView === 'starred') {
     displayFolders = starredFolders;
@@ -917,23 +1043,52 @@ export default function App() {
 
   if (!user) {
     return (
-      <div className="h-screen flex items-center justify-center bg-app-bg">
-        <div className="bg-card-bg p-8 rounded-2xl shadow-sm border border-border text-center max-w-md w-full mx-4">
-          <div className="w-16 h-16 bg-primary rounded-2xl flex items-center justify-center mx-auto mb-6">
-            <Folder className="w-8 h-8 text-white" />
+      <div className="min-h-screen flex items-center justify-center bg-app-bg px-4 relative overflow-hidden">
+        {/* Background Decorative Elements */}
+        <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] rounded-full bg-primary/10 blur-[100px]" />
+        <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] rounded-full bg-cyan-500/10 blur-[100px]" />
+        
+        <div className="bg-card-bg p-10 rounded-[32px] shadow-2xl border border-border/50 text-center max-w-lg w-full relative z-10 animate-in fade-in zoom-in-95 duration-500">
+          <div className="w-20 h-20 bg-gradient-to-tr from-primary to-cyan-500 rounded-3xl flex items-center justify-center mx-auto mb-8 shadow-inner">
+            <Cloud className="w-10 h-10 text-white" />
           </div>
-          <h1 className="text-2xl font-bold text-text-main mb-2">Google Drive</h1>
-          <p className="text-text-muted mb-8">Sign in to manage your files and folders.</p>
+          
+          <h1 className="text-3xl font-bold text-text-main mb-3">Cloud Storage Platform</h1>
+          <p className="text-text-muted mb-8 text-base">
+            Your personal, secure cloud storage integrated with Telegram. Free up your device storage while keeping everything perfectly organized in folders and easily searchable.
+          </p>
+
+          <div className="grid grid-cols-2 gap-4 mb-10 text-left">
+            <div className="bg-search-bg p-4 rounded-2xl">
+              <Folder className="w-6 h-6 text-primary mb-2" />
+              <h3 className="font-semibold text-text-main text-sm">Organized</h3>
+              <p className="text-xs text-text-muted mt-1">Structure with folders</p>
+            </div>
+            <div className="bg-search-bg p-4 rounded-2xl">
+              <Send className="w-6 h-6 text-primary mb-2" />
+              <h3 className="font-semibold text-text-main text-sm">Telegram Native</h3>
+              <p className="text-xs text-text-muted mt-1">Upload directly to channel</p>
+            </div>
+          </div>
+
           {error && (
-            <div className="bg-red-900/20 border border-red-500/50 text-red-200 p-3 rounded-lg mb-6 text-sm">
-              {error}
+            <div className="bg-red-900/20 border border-red-500/50 text-red-200 p-3 rounded-lg mb-6 text-sm flex items-start gap-3 text-left">
+              <AlertCircle className="w-5 h-5 text-red-400 shrink-0" />
+              <p>{error}</p>
             </div>
           )}
+
           <button 
             onClick={handleLogin}
-            className="w-full bg-primary text-[#ffdad5] py-3 rounded-xl font-semibold hover:bg-primary/90 transition-colors"
+            className="w-full bg-text-main text-app-bg py-4 rounded-2xl font-bold text-lg hover:opacity-90 active:scale-[0.98] transition-all flex items-center justify-center gap-3 shadow-lg"
           >
-            Sign in with Google
+            <svg viewBox="0 0 24 24" className="w-5 h-5" xmlns="http://www.w3.org/2000/svg">
+              <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
+              <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+              <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/>
+              <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
+            </svg>
+            Continue with Google
           </button>
         </div>
       </div>
@@ -1004,7 +1159,7 @@ export default function App() {
               type="file" 
               ref={sidebarFileInputRef} 
               className="hidden" 
-              accept="image/*"
+              accept="*"
               onChange={(e) => handleFileUpload(e, 'undefined_lookup')}
             />
             <button 
@@ -1041,12 +1196,13 @@ export default function App() {
           </div>
           
           <div className="px-7 py-4">
-            <div className="w-full bg-border h-1 rounded-full overflow-hidden">
-              <div className="bg-primary h-full w-[60%]" />
+            <div className="flex justify-between items-center mb-2">
+              <span className="text-[13px] font-medium text-text-main">{displayStorageText}</span>
+              <span className="text-[13px] font-medium text-text-muted">Unlimited</span>
             </div>
-            <p className="text-xs text-text-muted mt-2">
-              {((folders.reduce((acc, f) => acc + (f.size || 0), 0) + images.reduce((acc, i) => acc + (i.size || 0), 0)) / (1024 * 1024 * 1024)).toFixed(2)} GB used
-            </p>
+            <div className="w-full bg-border h-1 rounded-full overflow-hidden">
+              <div className="bg-primary h-full transition-all duration-500 ease-out" style={{ width: `${storagePercentage}%` }} />
+            </div>
           </div>
         </div>
         
@@ -1242,7 +1398,27 @@ export default function App() {
                   key={image.id}
                   draggable={sidebarView !== 'trash'}
                   onDragStart={(e) => sidebarView !== 'trash' && handleDragStart(e, image.id, 'image')}
-                  onClick={() => setPreviewImage(image.url || null)}
+                  onClick={() => {
+                    if (urlErrors[image.fileId]) {
+                      alert(`Preview unavailable: ${urlErrors[image.fileId]}\n\n(Telegram limits bot downloads to 20MB)`);
+                      return;
+                    }
+                    const url = imageUrls[image.fileId] || image.url;
+                    const ext = image.name?.split('.').pop()?.toLowerCase() || '';
+                    const isImg = ['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext);
+                    const isDoc = ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'pdf'].includes(ext);
+                    
+                    if (isImg) {
+                      setPreviewImage(url || null);
+                    } else if (url) {
+                      if (isDoc && ext !== 'pdf') {
+                        // Use Google Docs Viewer for office files to "open" without downloading
+                        window.open(`https://docs.google.com/viewer?url=${encodeURIComponent(url)}`, '_blank');
+                      } else {
+                        window.open(url, '_blank');
+                      }
+                    }
+                  }}
                   className={cn(
                     "bg-card-bg rounded-xl p-3 flex items-center justify-between cursor-pointer hover:bg-white/5 transition-colors",
                     sidebarView !== 'trash' && "cursor-grab active:cursor-grabbing",
@@ -1250,9 +1426,13 @@ export default function App() {
                   )}
                 >
                   <div className="flex items-center gap-3">
-                    <ImageIcon className="w-5 h-5 text-primary" />
+                    {urlErrors[image.fileId] ? (
+                      <AlertCircle className="w-5 h-5 text-red-500" />
+                    ) : (
+                      getFileIcon(image.name)
+                    )}
                     <span className="text-sm font-medium text-text-main truncate max-w-[200px]">
-                      {image.name || `Image_${image.id.slice(0,6)}.jpg`}
+                      {image.name || `File_${image.id.slice(0,6)}`}
                     </span>
                   </div>
                   <div className="flex items-center gap-2">
@@ -1298,13 +1478,13 @@ export default function App() {
                   )}
                 >
                   <div className="flex items-start justify-between mb-auto">
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 overflow-hidden flex-1">
                       {folder.isLocked ? (
                         <Lock className="w-5 h-5 text-primary" />
                       ) : (
                         <Folder className="w-5 h-5" style={{ color: folder.color || 'var(--color-folder)' }} fill="currentColor" />
                       )}
-                      <span className="text-sm font-medium text-text-main truncate max-w-[80px]">
+                      <span className="text-sm font-medium text-text-main truncate">
                         {folder.name}
                       </span>
                     </div>
@@ -1333,7 +1513,26 @@ export default function App() {
                     key={image.id}
                     draggable={sidebarView !== 'trash'}
                     onDragStart={(e) => sidebarView !== 'trash' && handleDragStart(e, image.id, 'image')}
-                    onClick={() => setPreviewImage(url || null)}
+                    onClick={() => {
+                      if (urlErrors[image.fileId]) {
+                        alert(`Preview unavailable: ${urlErrors[image.fileId]}\n\n(Telegram limits bot downloads to 20MB)`);
+                        return;
+                      }
+                      const ext = image.name?.split('.').pop()?.toLowerCase() || '';
+                      const isImg = ['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext);
+                      const isDoc = ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'pdf'].includes(ext);
+                      
+                      if (isImg) {
+                        setPreviewImage(url || null);
+                      } else if (url) {
+                        if (isDoc && ext !== 'pdf') {
+                          // Use Google Docs Viewer for office files
+                          window.open(`https://docs.google.com/viewer?url=${encodeURIComponent(url)}`, '_blank');
+                        } else {
+                          window.open(url, '_blank');
+                        }
+                      }
+                    }}
                     className={cn(
                       "bg-card-bg rounded-2xl overflow-hidden flex flex-col h-[200px] cursor-pointer active:scale-[0.98] transition-all border border-border/50",
                       sidebarView !== 'trash' && "cursor-grab active:cursor-grabbing",
@@ -1344,11 +1543,11 @@ export default function App() {
                     <div className="p-3 flex items-start justify-between">
                       <div className="flex items-center gap-2 overflow-hidden flex-1">
                         <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center shrink-0">
-                          <ImageIcon className="w-4 h-4 text-primary" />
+                          {getFileIcon(image.name)}
                         </div>
                         <div className="flex flex-col min-w-0">
                           <span className="text-xs font-semibold text-text-main truncate leading-tight">
-                            {image.name || `Image_${image.id.slice(0,6)}.jpg`}
+                            {image.name || `File_${image.id.slice(0,6)}`}
                           </span>
                           <span className="text-[10px] text-text-muted">
                             {new Date(image.createdAt).toLocaleDateString()}
@@ -1368,13 +1567,29 @@ export default function App() {
                     
                     {/* Image Preview Area */}
                     <div className="flex-1 bg-search-bg/40 relative mx-3 mb-3 rounded-xl overflow-hidden border border-border/30">
-                      {url ? (
+                      {url && ['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(image.name?.split('.').pop()?.toLowerCase() || '') ? (
                         <img 
                           src={url} 
                           alt="Content" 
                           className="w-full h-full object-cover"
                           loading="lazy"
                         />
+                      ) : url ? (
+                        <div className="absolute inset-0 flex flex-col items-center justify-center p-4">
+                           <div className="mb-2 scale-[1.5]">
+                             {getFileIcon(image.name)}
+                           </div>
+                           <span className="text-[10px] text-text-muted font-medium uppercase tracking-tight">
+                             {image.name?.split('.').pop() || 'File'}
+                           </span>
+                        </div>
+                      ) : urlErrors[image.fileId] ? (
+                        <div className="absolute inset-0 flex flex-col items-center justify-center bg-red-900/10 p-4 text-center">
+                          <AlertCircle className="w-8 h-8 text-red-500 mb-2 opacity-80" />
+                          <span className="text-[10px] font-medium text-red-400 line-clamp-2">
+                            {urlErrors[image.fileId]?.includes('too big') ? 'File too large for preview (>20MB)' : 'Preview unavailable'}
+                          </span>
+                        </div>
                       ) : (
                         <div className="absolute inset-0 flex items-center justify-center">
                           <div className="w-6 h-6 border-2 border-border border-t-primary rounded-full animate-spin" />
@@ -1432,7 +1647,7 @@ export default function App() {
                   <input
                     type="file"
                     id="scan-upload"
-                    accept="image/*"
+                    accept="*"
                     capture="environment"
                     className="hidden"
                     onChange={(e) => { setIsFabMenuOpen(false); handleFileUpload(e); }}
@@ -1440,7 +1655,7 @@ export default function App() {
                   />
                   <label htmlFor="scan-upload" className="flex items-center gap-4 bg-[#4a2824] text-[#ffdad5] px-5 py-3.5 rounded-2xl shadow-lg hover:bg-[#5c332e] transition-colors cursor-pointer">
                     <Camera className="w-5 h-5" />
-                    <span className="font-medium">Scan</span>
+                    <span className="font-medium">Camera</span>
                   </label>
                 </div>
 
@@ -1448,7 +1663,7 @@ export default function App() {
                   <input
                     type="file"
                     id="fab-upload"
-                    accept="image/*"
+                    accept="*"
                     className="hidden"
                     onChange={(e) => { setIsFabMenuOpen(false); handleFileUpload(e); }}
                     disabled={isUploading}
@@ -1563,63 +1778,76 @@ export default function App() {
       </main>
 
       {/* New Folder Modal */}
-      {isCreatingFolder && (
-        <div className="fixed inset-0 z-[100] bg-black/60 flex items-center justify-center p-4">
-          <div className="bg-card-bg w-full max-w-[320px] rounded-3xl p-6 shadow-2xl animate-in zoom-in-95">
-            <h3 className="text-xl font-medium text-text-main mb-4">New folder</h3>
-            <form onSubmit={handleCreateFolder}>
-              <input
-                type="text"
-                value={newFolderName}
-                onChange={(e) => setNewFolderName(e.target.value)}
-                className="w-full bg-transparent border border-primary text-text-main px-3 py-3 rounded-lg outline-none text-base mb-6 focus:ring-1 focus:ring-primary"
-                autoFocus
-                onFocus={(e) => e.target.select()}
-              />
-              <div className="mb-6">
-                <label className="text-xs text-text-muted mb-2 block uppercase font-medium">Folder Color</label>
-                <div className="flex gap-2 flex-wrap mb-2">
-                  {['#8c4a43', '#f43f5e', '#f59e0b', '#10b981', '#3b82f6', '#8b5cf6'].map(color => (
-                    <button
-                      key={color}
-                      type="button"
-                      onClick={() => setSelectedFolderColor(color)}
-                      className={cn(
-                        "w-8 h-8 rounded-full border-2 transition-all",
-                        selectedFolderColor === color ? "border-white scale-110" : "border-transparent"
-                      )}
-                      style={{ backgroundColor: color }}
-                    />
-                  ))}
-                </div>
+      <AnimatePresence>
+        {isCreatingFolder && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[100] bg-black/60 flex items-center justify-center p-4"
+          >
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              transition={{ type: 'spring', damping: 25, stiffness: 300 }}
+              className="bg-card-bg w-full max-w-[320px] rounded-3xl p-6 shadow-2xl"
+            >
+              <h3 className="text-xl font-medium text-text-main mb-4">New folder</h3>
+              <form onSubmit={handleCreateFolder}>
                 <input
                   type="text"
-                  value={selectedFolderColor}
-                  onChange={(e) => setSelectedFolderColor(e.target.value)}
-                  placeholder="#HexCode"
-                  className="w-full bg-transparent border border-border text-text-main px-3 py-2 rounded-lg text-sm outline-none font-mono"
+                  value={newFolderName}
+                  onChange={(e) => setNewFolderName(e.target.value)}
+                  className="w-full bg-transparent border border-primary text-text-main px-3 py-3 rounded-lg outline-none text-base mb-6 focus:ring-1 focus:ring-primary"
+                  autoFocus
+                  onFocus={(e) => e.target.select()}
                 />
-              </div>
-              <div className="flex justify-end gap-2">
-                <button 
-                  type="button" 
-                  onClick={() => setIsCreatingFolder(false)}
-                  className="text-sm font-medium text-primary hover:bg-primary/10 px-4 py-2 rounded-full transition-colors"
-                >
-                  Cancel
-                </button>
-                <button 
-                  type="submit"
-                  className="text-sm font-medium text-primary hover:bg-primary/10 px-4 py-2 rounded-full transition-colors"
-                  disabled={!newFolderName.trim()}
-                >
-                  Create
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
+                <div className="mb-6">
+                  <label className="text-xs text-text-muted mb-2 block uppercase font-medium">Folder Color</label>
+                  <div className="flex gap-2 flex-wrap mb-2">
+                    {['#8c4a43', '#f43f5e', '#f59e0b', '#10b981', '#3b82f6', '#8b5cf6'].map(color => (
+                      <button
+                        key={color}
+                        type="button"
+                        onClick={() => setSelectedFolderColor(color)}
+                        className={cn(
+                          "w-8 h-8 rounded-full border-2 transition-all",
+                          selectedFolderColor === color ? "border-white scale-110" : "border-transparent"
+                        )}
+                        style={{ backgroundColor: color }}
+                      />
+                    ))}
+                  </div>
+                  <input
+                    type="text"
+                    value={selectedFolderColor}
+                    onChange={(e) => setSelectedFolderColor(e.target.value)}
+                    placeholder="#HexCode"
+                    className="w-full bg-transparent border border-border text-text-main px-3 py-2 rounded-lg text-sm outline-none font-mono"
+                  />
+                </div>
+                <div className="flex justify-end gap-2">
+                  <button 
+                    type="button" 
+                    onClick={() => setIsCreatingFolder(false)}
+                    className="text-sm font-medium text-primary hover:bg-primary/10 px-4 py-2 rounded-full transition-colors"
+                  >
+                    Cancel
+                  </button>
+                  <button 
+                    type="submit"
+                    className="text-sm font-medium text-primary hover:bg-primary/10 px-4 py-2 rounded-full transition-colors"
+                    disabled={!newFolderName.trim()}
+                  >
+                    Create
+                  </button>
+                </div>
+              </form>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Folder Menu Modal */}
       {activeFolderMenu && (
@@ -1666,7 +1894,7 @@ export default function App() {
               <button 
                 onClick={() => {
                    setRenameFolderName(activeFolderMenu.name);
-                   setIsRenamingFolder(true);
+                   setRenamingFolderId(activeFolderMenu.id);
                    setActiveFolderMenu(null);
                 }} 
                 className="w-full flex items-center gap-4 px-6 py-3 hover:bg-white/5 text-text-main transition-colors"
@@ -1709,7 +1937,7 @@ export default function App() {
                 <FolderOutput className="w-5 h-5" />
                 <span className="font-medium text-sm">Move</span>
               </button>
-              <button onClick={() => { setActiveFolderMenu(null); alert("Information coming soon"); }} className="w-full flex items-center gap-4 px-6 py-3 hover:bg-white/5 text-text-main transition-colors">
+              <button onClick={() => { setActiveFolderMenu(null); setFolderInfoModal(activeFolderMenu); }} className="w-full flex items-center gap-4 px-6 py-3 hover:bg-white/5 text-text-main transition-colors">
                 <Info className="w-5 h-5" />
                 <span className="font-medium text-sm">View information</span>
               </button>
@@ -1732,7 +1960,7 @@ export default function App() {
       )}
 
       {/* Rename Folder Modal */}
-      {isRenamingFolder && (
+      {renamingFolderId && (
         <div className="fixed inset-0 z-[130] bg-black/60 flex items-center justify-center p-4">
           <div className="bg-card-bg w-full max-w-[320px] rounded-3xl p-6 shadow-2xl animate-in zoom-in-95">
             <h3 className="text-xl font-medium text-text-main mb-4">Rename folder</h3>
@@ -1748,7 +1976,7 @@ export default function App() {
               <div className="flex justify-end gap-2">
                 <button 
                   type="button" 
-                  onClick={() => setIsRenamingFolder(false)}
+                  onClick={() => setRenamingFolderId(null)}
                   className="text-sm font-medium text-primary hover:bg-primary/10 px-4 py-2 rounded-full transition-colors"
                 >
                   Cancel
@@ -1836,7 +2064,7 @@ export default function App() {
                 onClick={() => {
                    let defaultName = activeImageMenu.name || `Image_${activeImageMenu.id.slice(0,6)}.jpg`;
                    setRenameImageName(defaultName);
-                   setIsRenamingImage(true);
+                   setRenamingImageId(activeImageMenu.id);
                    setActiveImageMenu(null);
                 }} 
                 className="w-full flex items-center gap-4 px-6 py-3 hover:bg-white/5 text-text-main transition-colors"
@@ -1889,7 +2117,7 @@ export default function App() {
       )}
 
       {/* Rename Image Modal */}
-      {isRenamingImage && (
+      {renamingImageId && (
         <div className="fixed inset-0 z-[130] bg-black/60 flex items-center justify-center p-4">
           <div className="bg-card-bg w-full max-w-[320px] rounded-3xl p-6 shadow-2xl animate-in zoom-in-95">
             <h3 className="text-xl font-medium text-text-main mb-4">Rename item</h3>
@@ -1913,7 +2141,7 @@ export default function App() {
               <div className="flex justify-end gap-2">
                 <button 
                   type="button" 
-                  onClick={() => setIsRenamingImage(false)}
+                  onClick={() => setRenamingImageId(null)}
                   className="text-sm font-medium text-primary hover:bg-primary/10 px-4 py-2 rounded-full transition-colors"
                 >
                   Cancel
@@ -2040,20 +2268,27 @@ export default function App() {
                 <ArrowLeft className="w-5 h-5" />
               </button>
               <h1 className="text-lg font-medium text-text-main truncate">
-                {imageInfoModal.name || `Image_${imageInfoModal.id.slice(0,6)}.jpg`}
+                {imageInfoModal.name || `File_${imageInfoModal.id.slice(0,6)}`}
               </h1>
             </div>
             
-            {/* Image Preview */}
+            {/* Image Preview / Icon */}
             <div className="p-4 bg-app-bg flex justify-center">
-              {imageInfoModal.url ? (
+              {['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(imageInfoModal.name?.split('.').pop()?.toLowerCase() || '') && imageInfoModal.url ? (
                 <img 
                   src={imageInfoModal.url} 
                   alt="Preview" 
                   className="max-h-[300px] object-contain rounded-lg" 
                 />
               ) : (
-                <div className="w-full h-[200px] bg-search-bg rounded-lg animate-pulse" />
+                <div className="w-full h-[200px] bg-search-bg rounded-lg flex flex-col items-center justify-center gap-4">
+                  <div className="scale-[3]">
+                    {getFileIcon(imageInfoModal.name || '')}
+                  </div>
+                  <span className="text-text-muted text-sm font-medium uppercase tracking-widest mt-4">
+                    {imageInfoModal.name?.split('.').pop() || 'FILE'}
+                  </span>
+                </div>
               )}
             </div>
 
@@ -2061,7 +2296,7 @@ export default function App() {
             <div className="p-6 space-y-6">
               <div>
                 <p className="text-sm text-text-muted mb-1">Type</p>
-                <p className="text-base text-text-main font-medium">Image</p>
+                <p className="text-base text-text-main font-medium">{getFileTypeName(imageInfoModal.name || '')}</p>
               </div>
               
               <div>
@@ -2078,13 +2313,13 @@ export default function App() {
                 <div>
                   <p className="text-sm text-text-muted mb-1">Size</p>
                   <p className="text-base text-text-main font-medium">
-                    {imageInfoModal.size ? (imageInfoModal.size / (1024 * 1024)).toFixed(1) + ' MB' : '-'}
+                    {formatFileSize(imageInfoModal.size)}
                   </p>
                 </div>
                 <div>
                   <p className="text-sm text-text-muted mb-1">Storage used</p>
                   <p className="text-base text-text-main font-medium">
-                    {imageInfoModal.size ? (imageInfoModal.size / (1024 * 1024)).toFixed(1) + ' MB' : '-'}
+                    {formatFileSize(imageInfoModal.size)}
                   </p>
                 </div>
               </div>
@@ -2130,6 +2365,113 @@ export default function App() {
         </div>
       )}
 
+      {/* Folder Info Modal */}
+      {folderInfoModal && (
+        <div className="fixed inset-0 z-[130] bg-app-bg flex flex-col animate-in slide-in-from-right">
+          <div className="flex flex-col h-full bg-card-bg overflow-y-auto">
+            <div className="flex items-center gap-6 p-4 border-b border-border/50 sticky top-0 bg-card-bg/90 backdrop-blur z-10">
+              <button onClick={() => setFolderInfoModal(null)} className="text-text-main hover:bg-white/5 rounded-full p-2 -ml-2">
+                <ArrowLeft className="w-5 h-5" />
+              </button>
+              <h1 className="text-lg font-medium text-text-main truncate">
+                {folderInfoModal.name}
+              </h1>
+            </div>
+
+            <div className="p-6 pb-20">
+              <h2 className="text-sm font-semibold text-text-main mb-6 uppercase tracking-wider">Information</h2>
+              
+              <div className="space-y-6">
+                <div>
+                  <p className="text-sm text-text-muted mb-1">Type</p>
+                  <p className="text-base text-text-main font-medium">Folder</p>
+                </div>
+
+                <div>
+                  <p className="text-sm text-text-muted mb-1">Items inside</p>
+                  <p className="text-base text-text-main font-medium">
+                    {images.filter(i => i.folderId === folderInfoModal.id && !i.isDeleted).length} items
+                  </p>
+                </div>
+
+                <div>
+                  <p className="text-sm text-text-muted mb-1">Created</p>
+                  <p className="text-base text-text-main font-medium">
+                    {folderInfoModal.createdAt ? new Date(folderInfoModal.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'Unknown'}
+                  </p>
+                </div>
+              </div>
+              
+              <div className="h-px bg-border/50 my-6" />
+
+              <div>
+                <h3 className="text-base font-medium text-text-main mb-4">Activity</h3>
+                <div className="flex gap-4">
+                  <div className="w-10 h-10 rounded-full bg-primary flex items-center justify-center text-white font-medium shrink-0">
+                    {user?.displayName?.charAt(0).toUpperCase() || 'U'}
+                  </div>
+                  <div>
+                    <div className="flex items-center justify-between">
+                      <p className="text-base text-text-main font-medium">{user?.displayName || 'Unknown User'}</p>
+                    </div>
+                    <p className="text-sm text-text-muted">Created this folder</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Generic Toast Notification */}
+      <AnimatePresence>
+        {toast && (
+          <motion.div 
+            initial={{ opacity: 0, y: 50, x: '-50%' }}
+            animate={{ opacity: 1, y: 0, x: '-50%' }}
+            exit={{ opacity: 0, y: 20, x: '-50%' }}
+            className={cn(
+              "fixed bottom-[130px] md:bottom-32 left-1/2 -translate-x-1/2 z-[300] px-6 py-3 rounded-2xl shadow-2xl flex items-center gap-3 min-w-[300px] max-w-[90vw]",
+              toast.type === 'success' ? "bg-green-600/95 backdrop-blur-md text-white border border-green-400/20" : 
+              toast.type === 'error' ? "bg-red-600/95 backdrop-blur-md text-white border border-red-400/20" : 
+              "bg-primary/95 backdrop-blur-md text-white border border-white/10"
+            )}
+          >
+            {toast.type === 'success' && <CheckCircle className="w-5 h-5 shrink-0" />}
+            {toast.type === 'error' && <AlertOctagon className="w-5 h-5 shrink-0" />}
+            {toast.type === 'info' && <Info className="w-5 h-5 shrink-0" />}
+            <span className="text-sm font-semibold">{toast.message}</span>
+            <button 
+              onClick={() => setToast(null)}
+              className="ml-auto hover:bg-white/20 p-1 rounded-lg transition-colors"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Upload Progress Toast */}
+      {isUploading && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[200] bg-card-bg border border-border shadow-2xl rounded-2xl p-4 min-w-[320px] animate-in slide-in-from-bottom-5">
+          <div className="flex items-center justify-between mb-3 text-text-main">
+            <div className="flex items-center gap-3">
+              <Upload className="w-5 h-5 text-primary animate-bounce"/> 
+              <span className="font-medium">Uploading file...</span>
+            </div>
+            <span className="text-sm font-bold text-primary">
+              {uploadProgress >= 0 ? `${uploadProgress}%` : 'Starting...'}
+            </span>
+          </div>
+          <div className="w-full h-2 bg-border overflow-hidden rounded-full drop-shadow-sm">
+            <div 
+              className="h-full bg-primary transition-all duration-300 ease-out"
+              style={{ width: uploadProgress >= 0 ? `${uploadProgress}%` : '0%' }}
+            />
+          </div>
+        </div>
+      )}
+
       {/* Settings Modal */}
       {isSettingsOpen && (
         <div className="fixed inset-0 z-[200] bg-app-bg flex flex-col overflow-y-auto animate-in slide-in-from-bottom-4">
@@ -2169,6 +2511,51 @@ export default function App() {
                   <div className="text-[14px] text-text-muted mt-1">{settings.passcode ? 'Passcode is set' : 'Not set'}</div>
                 </div>
                 <Lock className={cn("w-5 h-5", settings.passcode ? "text-primary" : "text-text-muted")} />
+              </div>
+            </section>
+
+            {/* Telegram Configuration Section */}
+            <section>
+              <h2 className="text-[14px] font-semibold text-primary uppercase tracking-wider mb-4">Telegram Configuration</h2>
+              <div className="space-y-4">
+                <div className="flex flex-col gap-1">
+                  <label className="text-[14px] text-text-main font-medium">Bot Token</label>
+                  <p className="text-xs text-text-muted mb-1">Required to upload files. Create one via @BotFather on Telegram.</p>
+                  <input 
+                    type="password"
+                    value={telegramTokenInput}
+                    onChange={(e) => setTelegramTokenInput(e.target.value)}
+                    placeholder={settings.telegramBotToken ? "••••••••••••••••" : "Enter Telegram Bot Token"}
+                    className="bg-card-bg border border-border text-text-main text-sm rounded-lg px-3 py-2 outline-none focus:border-primary w-full"
+                  />
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-[14px] text-text-main font-medium">Channel ID</label>
+                  <p className="text-xs text-text-muted mb-1">The chat ID or channel ID where files will be sent (e.g. -100123456789). Always starts with a negative sign for channels.</p>
+                  <input 
+                    type="text"
+                    value={telegramChatIdInput}
+                    onChange={(e) => setTelegramChatIdInput(e.target.value)}
+                    placeholder={settings.telegramChatId || "Enter Channel/Chat ID"}
+                    className="bg-card-bg border border-border text-text-main text-sm rounded-lg px-3 py-2 outline-none focus:border-primary w-full"
+                  />
+                </div>
+                
+                <button 
+                  onClick={() => {
+                    updateSettings({ 
+                      telegramBotToken: telegramTokenInput || settings.telegramBotToken, 
+                      telegramChatId: telegramChatIdInput || settings.telegramChatId 
+                    });
+                    setTelegramTokenInput('');
+                    setTelegramChatIdInput('');
+                    alert("Telegram credentials saved!");
+                  }}
+                  disabled={!telegramTokenInput && !telegramChatIdInput}
+                  className="w-full bg-primary text-white py-2 rounded-lg font-medium text-sm disabled:opacity-50 hover:bg-primary/90 transition-colors"
+                >
+                  Save Configuration
+                </button>
               </div>
             </section>
 

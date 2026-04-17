@@ -14,6 +14,8 @@ export interface UserSettings {
   theme: 'system' | 'light' | 'dark';
   transferOverWifiOnly: boolean;
   passcode?: string;
+  telegramBotToken?: string;
+  telegramChatId?: string;
 }
 
 export interface DriveImage {
