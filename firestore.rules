@@ -1,0 +1,112 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+    
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+    
+    function isValidStringLength(field, minLen, maxLen) {
+      return request.resource.data[field] is string &&
+        request.resource.data[field].size() >= minLen &&
+        request.resource.data[field].size() <= maxLen;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+    function isValidFolder() {
+      return hasOnlyAllowedFields(['name', 'userId', 'createdAt', 'isDeleted', 'isStarred', 'color', 'parentId', 'isLocked']) &&
+             hasRequiredFields(['name', 'userId', 'createdAt']) &&
+             isValidStringLength('name', 1, 100) &&
+             incoming().userId == request.auth.uid &&
+             incoming().createdAt is timestamp &&
+             (!('isDeleted' in incoming()) || incoming().isDeleted is bool) &&
+             (!('isStarred' in incoming()) || incoming().isStarred is bool) &&
+             (!('color' in incoming()) || incoming().color is string) &&
+             (!('parentId' in incoming()) || incoming().parentId is string) &&
+             (!('isLocked' in incoming()) || incoming().isLocked is bool);
+    }
+
+    function isValidImage() {
+      return hasOnlyAllowedFields(['folderId', 'fileId', 'userId', 'createdAt', 'isDeleted', 'messageId', 'name', 'size', 'isStarred']) &&
+             hasRequiredFields(['folderId', 'fileId', 'userId', 'createdAt']) &&
+             isValidStringLength('folderId', 1, 100) &&
+             isValidStringLength('fileId', 1, 200) &&
+             incoming().userId == request.auth.uid &&
+             incoming().createdAt is timestamp &&
+             (!('isDeleted' in incoming()) || incoming().isDeleted is bool) &&
+             (!('messageId' in incoming()) || incoming().messageId is number) &&
+             (!('name' in incoming()) || incoming().name is string) &&
+             (!('size' in incoming()) || incoming().size is number) &&
+             (!('isStarred' in incoming()) || incoming().isStarred is bool);
+    }
+
+    function isValidSettings() {
+      return hasOnlyAllowedFields(['theme', 'transferOverWifiOnly', 'passcode', 'updatedAt']) &&
+             (!('theme' in incoming()) || incoming().theme in ['system', 'light', 'dark']) &&
+             (!('transferOverWifiOnly' in incoming()) || incoming().transferOverWifiOnly is bool) &&
+             (!('passcode' in incoming()) || incoming().passcode is string);
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+    
+    match /allowedUsers/{docId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && request.auth.token.email == 'saifulalammasud8@gmail.com';
+    }
+
+    match /userSettings/{userId} {
+      allow read, write: if isOwner(userId);
+    }
+
+    match /folders/{folderId} {
+      allow read: if isOwner(resource.data.userId);
+      allow create: if isAuthenticated() && isValidFolder();
+      allow update: if isOwner(resource.data.userId) && 
+                       isValidFolder() &&
+                       incoming().userId == resource.data.userId &&
+                       incoming().createdAt == resource.data.createdAt;
+      allow delete: if isOwner(resource.data.userId);
+    }
+
+    match /images/{imageId} {
+      allow read: if isOwner(resource.data.userId);
+      allow create: if isAuthenticated() && isValidImage();
+      allow update: if isOwner(resource.data.userId) && 
+                       isValidImage() &&
+                       incoming().userId == resource.data.userId &&
+                       incoming().createdAt == resource.data.createdAt;
+      allow delete: if isOwner(resource.data.userId);
+    }
+  }
+}

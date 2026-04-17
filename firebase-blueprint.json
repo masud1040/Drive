@@ -1,0 +1,133 @@
+{
+  "entities": {
+    "AllowedUser": {
+      "title": "AllowedUser",
+      "description": "An email address allowed to log in.",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "description": "The allowed email address"
+        }
+      },
+      "required": ["email"]
+    },
+    "Folder": {
+      "title": "Folder",
+      "description": "A folder to group images.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "The name of the folder"
+        },
+        "userId": {
+          "type": "string",
+          "description": "The UID of the user who owns this folder"
+        },
+        "createdAt": {
+          "type": "timestamp",
+          "description": "When the folder was created"
+        },
+        "isDeleted": {
+          "type": "boolean",
+          "description": "Whether the folder is in the trash"
+        },
+        "isStarred": {
+          "type": "boolean",
+          "description": "Whether the folder is stared"
+        },
+        "color": {
+          "type": "string",
+          "description": "Hex color code for the folder"
+        },
+        "parentId": {
+          "type": "string",
+          "description": "The ID of the parent folder (or 'root')"
+        },
+        "isLocked": {
+          "type": "boolean",
+          "description": "Whether the folder is password protected"
+        }
+      },
+      "required": ["name", "userId", "createdAt"]
+    },
+    "DriveImage": {
+      "title": "DriveImage",
+      "description": "An image uploaded to a folder.",
+      "type": "object",
+      "properties": {
+        "folderId": {
+          "type": "string",
+          "description": "The ID of the folder this image belongs to"
+        },
+        "fileId": {
+          "type": "string",
+          "description": "The Telegram file_id"
+        },
+        "userId": {
+          "type": "string",
+          "description": "The UID of the user who uploaded this image"
+        },
+        "createdAt": {
+          "type": "timestamp",
+          "description": "When the image was uploaded"
+        },
+        "isDeleted": {
+          "type": "boolean",
+          "description": "Whether the image is in the trash"
+        },
+        "name": {
+          "type": "string",
+          "description": "Custom name for the image"
+        },
+        "size": {
+          "type": "number",
+          "description": "Size of the image in bytes"
+        },
+        "messageId": {
+          "type": "number",
+          "description": "Telegram message ID"
+        },
+        "isStarred": {
+          "type": "boolean",
+          "description": "Whether the image is starred"
+        }
+      },
+      "required": ["folderId", "fileId", "userId", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/allowedUsers/{docId}": {
+      "schema": {
+        "$ref": "#/entities/AllowedUser"
+      },
+      "description": "Stores allowed email addresses"
+    },
+    "/folders/{folderId}": {
+      "schema": {
+        "$ref": "#/entities/Folder"
+      },
+      "description": "Stores user folders"
+    },
+    "/images/{imageId}": {
+      "schema": {
+        "$ref": "#/entities/DriveImage"
+      },
+      "description": "Stores image metadata"
+    },
+    "/userSettings/{userId}": {
+      "schema": {
+        "title": "UserSettings",
+        "type": "object",
+        "properties": {
+          "theme": { "type": "string", "enum": ["system", "light", "dark"] },
+          "transferOverWifiOnly": { "type": "boolean" },
+          "passcode": { "type": "string" },
+          "updatedAt": { "type": "timestamp" }
+        }
+      },
+      "description": "User specific settings and security preferences"
+    }
+  }
+}
